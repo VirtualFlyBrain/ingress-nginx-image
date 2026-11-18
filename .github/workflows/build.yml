@@ -1,0 +1,92 @@
+# Builds VFB's ingress-nginx controller image from the Chainguard-maintained fork
+# (https://github.com/chainguard-forks/ingress-nginx), whose security backports
+# (e.g. the Nov 2026 nginx HTTP/2 RCE fixes) are published as source only.
+#
+# The fork's default build uses the old upstream nginx base image, which lacks the
+# backports, so this builds the patched nginx base first and the controller on top.
+# Pushing is manual (workflow_dispatch with push=true) so a build can be tested first.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image to Docker Hub after the checks pass"
+        type: boolean
+        default: false
+  pull_request:
+    paths: [FORK_TAG, .github/workflows/build.yml]
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: docker.io/virtualflybrain/ingress-nginx-controller
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the fork tag
+        id: v
+        run: |
+          FT=$(tr -d '[:space:]' < FORK_TAG)
+          echo "fork_tag=$FT" >> "$GITHUB_OUTPUT"
+          echo "tag=${FT#controller-}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: chainguard-forks/ingress-nginx
+          ref: ${{ steps.v.outputs.fork_tag }}
+          path: src
+
+      - name: Check the security backports are present
+        run: |
+          ls src/images/nginx/rootfs/patches | grep -E 'CVE-2026-(123007|123633)' | tee found.txt
+          test "$(wc -l < found.txt)" -eq 2
+
+      - name: Build the patched nginx base image
+        run: |
+          cd src/images/nginx/rootfs
+          BT=$(cat ../TAG)
+          docker build --platform linux/amd64 -t vfb-local/nginx-base:$BT . 2>&1 | tee "$GITHUB_WORKSPACE/base.log"
+          # build.sh applies every file in patches/; confirm both CVE patches applied cleanly
+          grep -cE 'patching file' "$GITHUB_WORKSPACE/base.log"
+          ! grep -E 'Hunk .* FAILED|patch: \*\*\*\*' "$GITHUB_WORKSPACE/base.log"
+          echo "BASE_IMAGE=vfb-local/nginx-base:$BT" >> "$GITHUB_ENV"
+
+      - name: Build the controller image
+        env:
+          ARCH: amd64
+          REGISTRY: vfb-local
+        run: |
+          cd src
+          make BASE_IMAGE="$BASE_IMAGE" TAG=${{ steps.v.outputs.tag }} build image
+          docker tag vfb-local/controller:${{ steps.v.outputs.tag }} $IMAGE:${{ steps.v.outputs.tag }}
+
+      - name: Smoke test
+        run: |
+          I=$IMAGE:${{ steps.v.outputs.tag }}
+          docker run --rm --entrypoint /nginx-ingress-controller "$I" --version
+          docker run --rm --entrypoint nginx "$I" -V 2>&1 | tee nginx-V.txt
+          grep -q 'nginx/1.27.1' nginx-V.txt
+          grep -q -- '--with-http_v2_module' nginx-V.txt
+
+      - name: Log in to Docker Hub
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Push and record the digest
+        if: inputs.push
+        run: |
+          docker push $IMAGE:${{ steps.v.outputs.tag }}
+          D=$(docker inspect --format '{{index .RepoDigests 0}}' $IMAGE:${{ steps.v.outputs.tag }})
+          echo "Pushed **$D** (fork tag ${{ steps.v.outputs.fork_tag }})" >> "$GITHUB_STEP_SUMMARY"
